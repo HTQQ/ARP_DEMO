@@ -1,0 +1,151 @@
+stages:
+  - sast-analyze
+  - unit-test
+  - visualize
+  - test
+
+unit-test:
+  tags:
+    - java-amd64
+  stage: unit-test
+  image: maven:3.6.3-jdk-8
+  before_script:
+    - wget 'https://group-bison.oss-cn-beijing.aliyuncs.com/settings.xml' -O ./settings.xml   # download settings to local
+  script:
+    - mvn clean install -Dmaven.test.failure.ignore=true -s ./settings.xml -q
+    - cd $CI_PROJECT_DIR/servers && mvn jacoco:report
+    - cd $CI_PROJECT_DIR/services && mvn jacoco:report
+  artifacts:
+    expire_in: 2 week
+    paths:
+      - $CI_PROJECT_DIR/servers/backend-server-server/target/site/jacoco
+      - $CI_PROJECT_DIR/servers/backend-server-server/target/surefire-reports
+      - $CI_PROJECT_DIR/servers/mobile-server/target/site/jacoco
+      - $CI_PROJECT_DIR/servers/mobile-server/target/surefire-reports
+      - $CI_PROJECT_DIR/services/user/target/site/jacoco
+      - $CI_PROJECT_DIR/services/user/target/surefire-reports
+      - $CI_PROJECT_DIR/services/order/target/site/jacoco
+      - $CI_PROJECT_DIR/services/order/target/surefire-reports
+      - $CI_PROJECT_DIR/services/manage/target/site/jacoco
+      - $CI_PROJECT_DIR/services/manage/target/surefire-reports
+      - $CI_PROJECT_DIR/services/assets/target/site/jacoco
+      - $CI_PROJECT_DIR/services/assets/target/surefire-reports
+  only:
+    refs:
+      - juji_dev
+
+.base-coverage:
+  needs: [ "unit-test" ]
+  tags:
+    - java-amd64
+  stage: visualize
+  image: registry.gitlab.com/haynes/jacoco2cobertura:1.0.7
+  script:
+    - "[ -f $CI_PROJECT_DIR/$PROJECT_PATH/target/site/jacoco/index.html ] && cat $CI_PROJECT_DIR/$PROJECT_PATH/target/site/jacoco/index.html"
+    - "[ -f $CI_PROJECT_DIR/$PROJECT_PATH/target/site/jacoco/jacoco.xml ] && python /opt/cover2cover.py $CI_PROJECT_DIR/$PROJECT_PATH/target/site/jacoco/jacoco.xml $CI_PROJECT_DIR/$PROJECT_PATH/src/main/java/ > $CI_PROJECT_DIR/$PROJECT_PATH/target/site/cobertura.xml"
+  coverage: '/Total.*?([0-9]{1,3})%/'
+  artifacts:
+    expire_in: 2 week
+    reports:
+      junit: $CI_PROJECT_DIR/$PROJECT_PATH/target/surefire-reports/TEST-*.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: $CI_PROJECT_DIR/$PROJECT_PATH/target/site/cobertura.xml
+  only:
+    refs:
+      - juji_dev
+
+backend-server-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: servers/backend-server-server
+
+mobile-server-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: servers/mobile-server
+
+user-service-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: services/user
+
+order-service-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: services/order
+
+manage-service-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: services/manage
+
+assets-service-coverage:
+  extends: .base-coverage
+  variables:
+    PROJECT_PATH: services/assets
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+sast:
+  tags:
+    - java-amd64
+  stage: sast-analyze
+
+code_quality:
+  tags:
+    - java-amd64
+  stage: test
+  needs: []
+  image: docker:20.10.12
+  allow_failure: true
+  services:
+    - name: 'docker:20.10.12-dind'
+      command: ['--tls=false', '--host=tcp://0.0.0.0:2375']
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_CERT_PATH: ""
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_TLS_VERIFY: ""
+    CODE_QUALITY_IMAGE_TAG: "0.96.0"
+    CODE_QUALITY_IMAGE: "$CI_TEMPLATE_REGISTRY_HOST/gitlab-org/ci-cd/codequality:$CODE_QUALITY_IMAGE_TAG"
+    DOCKER_SOCKET_PATH: /var/run/docker.sock
+  script:
+    - cd $CI_PROJECT_DIR
+    - |
+      if ! docker info &>/dev/null; then
+        if [ -z "$DOCKER_HOST" ] && [ -n "$KUBERNETES_PORT" ]; then
+          export DOCKER_HOST='tcp://localhost:2375'
+        fi
+      fi
+    - | # this is required to avoid undesirable reset of Docker image ENV variables being set on build stage
+      function propagate_env_vars() {
+        CURRENT_ENV=$(printenv)
+
+        for VAR_NAME; do
+          echo $CURRENT_ENV | grep "${VAR_NAME}=" > /dev/null && echo "--env $VAR_NAME "
+        done
+      }
+    - |
+      if [ -n "$CODECLIMATE_REGISTRY_USERNAME" ] && [ -n "$CODECLIMATE_REGISTRY_PASSWORD" ] && [ -n "$CODECLIMATE_PREFIX" ]; then
+        CODECLIMATE_REGISTRY=${CODECLIMATE_PREFIX%%/*}
+        docker login "$CODECLIMATE_REGISTRY" --username "$CODECLIMATE_REGISTRY_USERNAME" --password "$CODECLIMATE_REGISTRY_PASSWORD"
+      fi
+    - docker pull --quiet "$CODE_QUALITY_IMAGE"
+    - echo $(propagate_env_vars SOURCE_CODE TIMEOUT_SECONDS CODECLIMATE_DEBUG CODECLIMATE_DEV REPORT_STDOUT REPORT_FORMAT ENGINE_MEMORY_LIMIT_BYTES CODECLIMATE_PREFIX CODECLIMATE_REGISTRY_USERNAME CODECLIMATE_REGISTRY_PASSWORD DOCKER_SOCKET_PATH)
+    - cd $CI_PROJECT_DIR/.. && mkdir -p /cache/code && rm -rf /cache/code/backend && rm -rf backend/.git && cp -r backend /cache/code/
+    - export SOURCE_CODE_LOCAL_PATH=/home/juji/data/gitlab-runner/cache/code/backend
+    - docker run --rm -e SOURCE_CODE=$SOURCE_CODE_LOCAL_PATH -e REPORT_FORMAT=html -v $SOURCE_CODE_LOCAL_PATH:$SOURCE_CODE_LOCAL_PATH -v /var/run/docker.sock:/var/run/docker.sock "$CODE_QUALITY_IMAGE" $SOURCE_CODE_LOCAL_PATH
+    - cp /cache/code/backend/gl-code-quality-report.* $CI_PROJECT_DIR/
+  artifacts:
+    expire_in: 2 week
+    paths:
+      - gl-code-quality-report.html
+    reports:
+      codequality: gl-code-quality-report.html
+  dependencies: []
+  rules:
+    - if: '$CODE_QUALITY_DISABLED'
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
